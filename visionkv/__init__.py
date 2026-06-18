@@ -4,6 +4,7 @@ from .benchmark_harness import BenchmarkComparison, BenchmarkSample, compare_sam
 from .block_manager import MockBlockSpaceManager
 from .controller import VisionKVController
 from .integration_harness import OpenAIServerHarness, VisionConversationScenario
+from .policy import VisionKVPolicy
 from .pytorch_prototype import TorchVisionKVPrototype, torch_available
 from .vllm_adapter import VisionBlockMetadataStore, VisionKVVllmAdapter, vllm_available
 
@@ -12,6 +13,7 @@ __all__ = [
     "BenchmarkSample",
     "MockBlockSpaceManager",
     "OpenAIServerHarness",
+    "VisionKVPolicy",
     "VisionKVController",
     "VisionConversationScenario",
     "TorchVisionKVPrototype",

@@ -6,6 +6,7 @@ import unittest
 
 from visionkv.block_manager import MockBlockSpaceManager
 from visionkv.controller import VisionKVController
+from visionkv.policy import VisionKVPolicy
 from visionkv.vllm_adapter import VisionBlockMetadataStore, VisionKVVllmAdapter
 
 
@@ -30,6 +31,7 @@ class MetadataStoreTests(unittest.TestCase):
 
         self.assertEqual(store.get_vision_block_ids("req-1"), [4, 1, 9])
         self.assertEqual(store.get_hot_vision_block_ids("req-1", 2), [4, 1])
+        self.assertEqual(store.get_cold_vision_block_ids("req-1", 2), [9])
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +50,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             prefetch_delay_s=0.0,
         )
         store = VisionBlockMetadataStore()
-        adapter = VisionKVVllmAdapter(store, controller)
+        adapter = VisionKVVllmAdapter(
+            store,
+            controller,
+            policy=VisionKVPolicy(background_prefetch_remainder=False),
+        )
 
         adapter.on_prompt_preprocessed("req-1", vision_token_start=0, vision_token_end=48)
         adapter.on_block_allocated("req-1", logical_block_id=0, token_start=0, token_end=16)
@@ -84,7 +90,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             prefetch_delay_s=0.0,
         )
         store = VisionBlockMetadataStore()
-        adapter = VisionKVVllmAdapter(store, controller, hot_prefetch_block_count=2)
+        adapter = VisionKVVllmAdapter(
+            store,
+            controller,
+            policy=VisionKVPolicy(
+                hot_prefetch_block_count=2,
+                background_prefetch_remainder=True,
+            ),
+        )
 
         adapter.on_prompt_preprocessed("req-hot", vision_token_start=0, vision_token_end=64)
         adapter.on_block_allocated("req-hot", logical_block_id=0, token_start=0, token_end=16)
@@ -110,6 +123,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             sorted(store.sequence_states["req-hot"].offloaded_block_ids),
             [2, 3],
         )
+
+        stalled = await adapter.complete_background_prefetch("req-hot")
+        self.assertTrue(stalled)
+        self.assertEqual(
+            len(manager.get_blocks(modality="vision", location="gpu")),
+            4,
+        )
+        self.assertFalse(store.needs_prefetch("req-hot"))
 
     async def test_before_attention_forward_skips_when_request_has_no_offloaded_blocks(self) -> None:
         manager = MockBlockSpaceManager()

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
 from .controller import VisionKVController
+from .policy import VisionKVPolicy
 
 
 def vllm_available() -> bool:
@@ -82,6 +83,16 @@ class VisionBlockMetadataStore:
             return vision_block_ids
         return vision_block_ids[:hot_block_count]
 
+    def get_cold_vision_block_ids(
+        self,
+        request_id: str,
+        hot_block_count: int | None,
+    ) -> List[int]:
+        if hot_block_count is None:
+            return []
+        vision_block_ids = self.get_vision_block_ids(request_id)
+        return vision_block_ids[hot_block_count:]
+
     def mark_offloaded(self, request_id: str, logical_block_ids: List[int]) -> None:
         state = self.sequence_states[request_id]
         state.offloaded_block_ids.update(logical_block_ids)
@@ -101,11 +112,11 @@ class VisionKVVllmAdapter:
         self,
         metadata_store: VisionBlockMetadataStore,
         controller: VisionKVController,
-        hot_prefetch_block_count: int | None = None,
+        policy: VisionKVPolicy | None = None,
     ) -> None:
         self.metadata_store = metadata_store
         self.controller = controller
-        self.hot_prefetch_block_count = hot_prefetch_block_count
+        self.policy = policy or VisionKVPolicy()
 
     def on_prompt_preprocessed(
         self, request_id: str, vision_token_start: int, vision_token_end: int
@@ -151,9 +162,19 @@ class VisionKVVllmAdapter:
         if vision_attention_mass >= self.controller.hot_attention_threshold:
             hot_block_ids = self.metadata_store.get_hot_vision_block_ids(
                 request_id,
-                self.hot_prefetch_block_count,
+                self.policy.hot_prefetch_block_count,
             )
-            self.controller.request_vision_attention(hot_block_ids)
+            cold_block_ids = self.metadata_store.get_cold_vision_block_ids(
+                request_id,
+                self.policy.hot_prefetch_block_count,
+            )
+            continuation_ids = (
+                cold_block_ids if self.policy.background_prefetch_remainder else None
+            )
+            self.controller.request_vision_attention(
+                hot_block_ids,
+                continuation_logical_block_ids=continuation_ids,
+            )
             return "prefetch-requested"
 
         vision_blocks_on_gpu = self.controller.block_manager.get_blocks(
@@ -178,10 +199,24 @@ class VisionKVVllmAdapter:
 
         prefetched_ids = self.metadata_store.get_hot_vision_block_ids(
             request_id,
-            self.hot_prefetch_block_count,
+            self.policy.hot_prefetch_block_count,
         )
         stalled = await self.controller.ensure_vision_ready(prefetched_ids)
         self.metadata_store.mark_prefetched(request_id, prefetched_ids)
+        return stalled
+
+    async def complete_background_prefetch(self, request_id: str) -> bool:
+        """Wait for any queued background remainder restore and mark it available."""
+
+        background_ids = self.metadata_store.get_cold_vision_block_ids(
+            request_id,
+            self.policy.hot_prefetch_block_count,
+        )
+        if not background_ids:
+            return False
+
+        stalled = await self.controller.ensure_background_prefetch_complete(background_ids)
+        self.metadata_store.mark_prefetched(request_id, background_ids)
         return stalled
 
     def describe_real_integration_points(self) -> Dict[str, str]:
@@ -201,6 +236,7 @@ class VisionKVVllmAdapter:
             ),
             "worker_forward": (
                 "Before attention runs, wait only if the request still needs "
-                "vision blocks and the async prefetch has not completed yet."
+                "the hot set, while lower-priority remainder blocks can stream "
+                "back in the background."
             ),
         }

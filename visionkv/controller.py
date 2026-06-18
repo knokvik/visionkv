@@ -42,6 +42,8 @@ class VisionKVController:
         self.events: List[DecodeEvent] = []
         self._prefetch_task: Optional[asyncio.Task[None]] = None
         self._prefetch_target_ids: Optional[List[int]] = None
+        self._background_prefetch_task: Optional[asyncio.Task[None]] = None
+        self._background_prefetch_target_ids: Optional[List[int]] = None
 
     async def observe_decode_step(
         self,
@@ -71,14 +73,27 @@ class VisionKVController:
             )
         )
 
-    def request_vision_attention(self, logical_block_ids: Optional[List[int]] = None) -> None:
+    def request_vision_attention(
+        self,
+        logical_block_ids: Optional[List[int]] = None,
+        continuation_logical_block_ids: Optional[List[int]] = None,
+    ) -> None:
         target_ids = self._resolve_prefetch_target_ids(logical_block_ids)
-        if not target_ids:
+        continuation_ids = self._resolve_prefetch_target_ids(continuation_logical_block_ids)
+        if not target_ids and not continuation_ids:
             return
 
-        if self._prefetch_task is None or self._prefetch_task.done():
+        if target_ids and (self._prefetch_task is None or self._prefetch_task.done()):
             self._prefetch_target_ids = target_ids
             self._prefetch_task = asyncio.create_task(self._prefetch_vision_blocks(target_ids))
+
+        if continuation_ids and (
+            self._background_prefetch_task is None or self._background_prefetch_task.done()
+        ):
+            self._background_prefetch_target_ids = continuation_ids
+            self._background_prefetch_task = asyncio.create_task(
+                self._prefetch_after_current(continuation_ids)
+            )
 
     async def ensure_vision_ready(self, logical_block_ids: Optional[List[int]] = None) -> bool:
         """Wait for in-flight prefetch if the next attention step needs vision blocks.
@@ -104,6 +119,25 @@ class VisionKVController:
             return False
 
         await self._prefetch_task
+        return True
+
+    async def ensure_background_prefetch_complete(
+        self,
+        logical_block_ids: Optional[List[int]] = None,
+    ) -> bool:
+        """Wait for any queued background remainder prefetch."""
+
+        if not self._resolve_prefetch_target_ids(logical_block_ids):
+            return False
+
+        if self._background_prefetch_task is None:
+            return False
+
+        if self._background_prefetch_task.done():
+            await self._background_prefetch_task
+            return False
+
+        await self._background_prefetch_task
         return True
 
     def _resolve_prefetch_target_ids(self, logical_block_ids: Optional[List[int]]) -> List[int]:
@@ -152,3 +186,11 @@ class VisionKVController:
             f"[prefetch] step={self.decode_step} restored={restored_mb}MB | "
             f"{self.block_manager.summary()}"
         )
+
+    async def _prefetch_after_current(self, logical_ids: List[int]) -> None:
+        if self._prefetch_task is not None:
+            await self._prefetch_task
+        # Let the caller proceed with the hot-set first so the background
+        # remainder behaves like a lower-priority continuation.
+        await asyncio.sleep(0)
+        await self._prefetch_vision_blocks(logical_ids)
