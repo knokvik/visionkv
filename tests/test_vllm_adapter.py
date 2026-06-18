@@ -21,6 +21,16 @@ class MetadataStoreTests(unittest.TestCase):
         self.assertFalse(text_hit)
         self.assertEqual(store.get_vision_block_ids("req-1"), [7])
 
+    def test_hot_vision_block_ids_preserve_allocation_order(self) -> None:
+        store = VisionBlockMetadataStore()
+        store.register_sequence("req-1", vision_start=0, vision_end=64)
+        store.record_block_assignment("req-1", 4, token_start=16, token_end=32)
+        store.record_block_assignment("req-1", 1, token_start=0, token_end=16)
+        store.record_block_assignment("req-1", 9, token_start=32, token_end=48)
+
+        self.assertEqual(store.get_vision_block_ids("req-1"), [4, 1, 9])
+        self.assertEqual(store.get_hot_vision_block_ids("req-1", 2), [4, 1])
+
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_adapter_tracks_offload_and_prefetch_state(self) -> None:
@@ -58,6 +68,48 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         stalled = await adapter.before_attention_forward("req-1")
         self.assertFalse(stalled)
         self.assertFalse(store.needs_prefetch("req-1"))
+
+    async def test_adapter_prefetches_only_budgeted_hot_subset(self) -> None:
+        manager = MockBlockSpaceManager()
+        for _ in range(4):
+            manager.allocate_block(modality="vision", tensor_size_mb=128)
+        for _ in range(21):
+            manager.allocate_block(modality="text", tensor_size_mb=64)
+
+        controller = VisionKVController(
+            manager,
+            text_eviction_threshold=20,
+            cold_steps_required=2,
+            offload_delay_s=0.0,
+            prefetch_delay_s=0.0,
+        )
+        store = VisionBlockMetadataStore()
+        adapter = VisionKVVllmAdapter(store, controller, hot_prefetch_block_count=2)
+
+        adapter.on_prompt_preprocessed("req-hot", vision_token_start=0, vision_token_end=64)
+        adapter.on_block_allocated("req-hot", logical_block_id=0, token_start=0, token_end=16)
+        adapter.on_block_allocated("req-hot", logical_block_id=1, token_start=16, token_end=32)
+        adapter.on_block_allocated("req-hot", logical_block_id=2, token_start=32, token_end=48)
+        adapter.on_block_allocated("req-hot", logical_block_id=3, token_start=48, token_end=64)
+
+        await adapter.on_decode_step("req-hot", 0.01)
+        status = await adapter.on_decode_step("req-hot", 0.01)
+        self.assertEqual(status, "vision-offloaded")
+        self.assertEqual(store.get_vision_block_ids("req-hot"), [0, 1, 2, 3])
+
+        status = await adapter.on_decode_step("req-hot", 0.30)
+        self.assertEqual(status, "prefetch-requested")
+
+        stalled = await adapter.before_attention_forward("req-hot")
+        self.assertFalse(stalled)
+        self.assertEqual(
+            len(manager.get_blocks(modality="vision", location="gpu")),
+            2,
+        )
+        self.assertEqual(
+            sorted(store.sequence_states["req-hot"].offloaded_block_ids),
+            [2, 3],
+        )
 
     async def test_before_attention_forward_skips_when_request_has_no_offloaded_blocks(self) -> None:
         manager = MockBlockSpaceManager()

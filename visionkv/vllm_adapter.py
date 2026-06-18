@@ -33,7 +33,7 @@ class TokenSpan:
 class SequenceVisionState:
     request_id: str
     vision_token_span: TokenSpan
-    vision_block_ids: Set[int] = field(default_factory=set)
+    vision_block_ids: List[int] = field(default_factory=list)
     offloaded_block_ids: Set[int] = field(default_factory=set)
 
 
@@ -64,12 +64,23 @@ class VisionBlockMetadataStore:
         if not state.vision_token_span.overlaps(token_start, token_end):
             return False
 
-        state.vision_block_ids.add(logical_block_id)
+        if logical_block_id not in state.vision_block_ids:
+            state.vision_block_ids.append(logical_block_id)
         self.block_to_request[logical_block_id] = request_id
         return True
 
     def get_vision_block_ids(self, request_id: str) -> List[int]:
-        return sorted(self.sequence_states[request_id].vision_block_ids)
+        return list(self.sequence_states[request_id].vision_block_ids)
+
+    def get_hot_vision_block_ids(
+        self,
+        request_id: str,
+        hot_block_count: int | None,
+    ) -> List[int]:
+        vision_block_ids = self.get_vision_block_ids(request_id)
+        if hot_block_count is None:
+            return vision_block_ids
+        return vision_block_ids[:hot_block_count]
 
     def mark_offloaded(self, request_id: str, logical_block_ids: List[int]) -> None:
         state = self.sequence_states[request_id]
@@ -90,9 +101,11 @@ class VisionKVVllmAdapter:
         self,
         metadata_store: VisionBlockMetadataStore,
         controller: VisionKVController,
+        hot_prefetch_block_count: int | None = None,
     ) -> None:
         self.metadata_store = metadata_store
         self.controller = controller
+        self.hot_prefetch_block_count = hot_prefetch_block_count
 
     def on_prompt_preprocessed(
         self, request_id: str, vision_token_start: int, vision_token_end: int
@@ -128,12 +141,19 @@ class VisionKVVllmAdapter:
         Triton/CUDA sidecar that summarizes attention to vision-token blocks.
         """
 
-        await self.controller.observe_decode_step(vision_attention_mass)
+        await self.controller.observe_decode_step(
+            vision_attention_mass,
+            trigger_hot_prefetch=False,
+        )
         if not self.metadata_store.get_vision_block_ids(request_id):
             return "no-vision-blocks"
 
         if vision_attention_mass >= self.controller.hot_attention_threshold:
-            self.controller.request_vision_attention()
+            hot_block_ids = self.metadata_store.get_hot_vision_block_ids(
+                request_id,
+                self.hot_prefetch_block_count,
+            )
+            self.controller.request_vision_attention(hot_block_ids)
             return "prefetch-requested"
 
         vision_blocks_on_gpu = self.controller.block_manager.get_blocks(
@@ -156,8 +176,11 @@ class VisionKVVllmAdapter:
         if not self.metadata_store.needs_prefetch(request_id):
             return False
 
-        stalled = await self.controller.ensure_vision_ready()
-        prefetched_ids = self.metadata_store.get_vision_block_ids(request_id)
+        prefetched_ids = self.metadata_store.get_hot_vision_block_ids(
+            request_id,
+            self.hot_prefetch_block_count,
+        )
+        stalled = await self.controller.ensure_vision_ready(prefetched_ids)
         self.metadata_store.mark_prefetched(request_id, prefetched_ids)
         return stalled
 
@@ -174,7 +197,7 @@ class VisionKVVllmAdapter:
             ),
             "decode_loop": (
                 "Consume block-level vision attention mass after each decode "
-                "step and trigger cold eviction or hot prefetch."
+                "step and trigger cold eviction or budgeted hot-set prefetch."
             ),
             "worker_forward": (
                 "Before attention runs, wait only if the request still needs "
