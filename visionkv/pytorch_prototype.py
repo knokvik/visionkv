@@ -102,6 +102,51 @@ class TransferReport:
     used_staging_pool: bool
 
 
+@dataclass
+class PrefetchBudgetRecommendation:
+    latency_budget_ms: float
+    recommended_block_count: int
+    recommended_bytes: int
+    recommended_total_ms: float
+
+
+@dataclass
+class PrefetchSweepResult:
+    reports: List[TransferReport]
+    recommendation: PrefetchBudgetRecommendation
+
+
+def recommend_prefetch_block_count(
+    reports: List[TransferReport],
+    latency_budget_ms: float,
+) -> PrefetchBudgetRecommendation:
+    """Pick the largest hot-set that stays within the flashback budget."""
+
+    if latency_budget_ms <= 0:
+        raise ValueError("latency_budget_ms must be positive.")
+    if not reports:
+        raise ValueError("At least one transfer report is required.")
+
+    sorted_reports = sorted(reports, key=lambda report: report.blocks_moved)
+    eligible_reports = [
+        report for report in sorted_reports if report.total_ms <= latency_budget_ms
+    ]
+    chosen = eligible_reports[-1] if eligible_reports else sorted_reports[0]
+    return PrefetchBudgetRecommendation(
+        latency_budget_ms=latency_budget_ms,
+        recommended_block_count=chosen.blocks_moved,
+        recommended_bytes=chosen.total_bytes,
+        recommended_total_ms=chosen.total_ms,
+    )
+
+
+def parse_int_csv(raw_value: str) -> List[int]:
+    values = [int(part.strip()) for part in raw_value.split(",") if part.strip()]
+    if not values:
+        raise ValueError("Expected at least one integer value.")
+    return values
+
+
 class TorchVisionKVPrototype:
     """Real tensor transfer prototype for the next VisionKV stage."""
 
@@ -235,6 +280,17 @@ class TorchVisionKVPrototype:
             )
             background_report = self.prefetch_vision_blocks()
             print(self._format_transfer_report(background_report))
+
+    def run_until_prefetch(self) -> TransferReport:
+        for _ in range(self.config.num_vision_blocks):
+            self.allocate_block("vision", self.config.vision_block_mb)
+
+        for step in range(1, self.config.num_text_blocks + 1):
+            self.allocate_block("text", self.config.text_block_mb)
+            if step == self.config.text_eviction_threshold + 1:
+                self.offload_vision_blocks()
+
+        return self.prefetch_vision_blocks(block_limit=self.config.prefetch_block_count)
 
     def _move_blocks(self, blocks: List[TensorBlock], destination: str) -> TransferReport:
         if not blocks:
@@ -377,6 +433,44 @@ class TorchVisionKVPrototype:
         )
 
 
+def run_prefetch_sweep(
+    config: PrototypeConfig,
+    block_counts: List[int],
+    latency_budget_ms: float,
+) -> PrefetchSweepResult:
+    reports: List[TransferReport] = []
+    for block_count in block_counts:
+        sweep_config = PrototypeConfig(
+            num_vision_blocks=config.num_vision_blocks,
+            vision_block_mb=config.vision_block_mb,
+            num_text_blocks=config.num_text_blocks,
+            text_block_mb=config.text_block_mb,
+            text_eviction_threshold=config.text_eviction_threshold,
+            prefetch_block_count=block_count,
+            background_prefetch_remainder=False,
+            overlap_matmul_dim=config.overlap_matmul_dim,
+            preferred_device=config.preferred_device,
+        )
+        prototype = TorchVisionKVPrototype(sweep_config)
+        reports.append(prototype.run_until_prefetch())
+
+    return PrefetchSweepResult(
+        reports=reports,
+        recommendation=recommend_prefetch_block_count(reports, latency_budget_ms),
+    )
+
+
+def format_prefetch_budget_recommendation(
+    recommendation: PrefetchBudgetRecommendation,
+) -> str:
+    return (
+        f"budget_ms={recommendation.latency_budget_ms:.2f} "
+        f"recommended_blocks={recommendation.recommended_block_count} "
+        f"recommended_bytes={format_bytes(recommendation.recommended_bytes)} "
+        f"expected_total_ms={recommendation.recommended_total_ms:.2f}"
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the VisionKV PyTorch prototype.")
     parser.add_argument("--num-vision-blocks", type=int, default=10)
@@ -389,6 +483,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-background-prefetch-remainder",
         action="store_true",
         help="Skip the follow-on restore of blocks not included in the initial hot prefetch.",
+    )
+    parser.add_argument(
+        "--prefetch-sweep-counts",
+        help="Comma-separated hot-set sizes to benchmark, for example '1,2,4'.",
+    )
+    parser.add_argument(
+        "--flashback-budget-ms",
+        type=float,
+        default=50.0,
+        help="Latency budget used when recommending a hot-set size from a sweep.",
     )
     parser.add_argument("--overlap-matmul-dim", type=int, default=1024)
     parser.add_argument("--preferred-device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
@@ -412,6 +516,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         overlap_matmul_dim=args.overlap_matmul_dim,
         preferred_device=args.preferred_device,
     )
+    if args.prefetch_sweep_counts:
+        sweep = run_prefetch_sweep(
+            config=config,
+            block_counts=parse_int_csv(args.prefetch_sweep_counts),
+            latency_budget_ms=args.flashback_budget_ms,
+        )
+        print("== VisionKV Prefetch Sweep ==")
+        for report in sweep.reports:
+            print(TorchVisionKVPrototype._format_transfer_report(report))
+        print(format_prefetch_budget_recommendation(sweep.recommendation))
+        return 0
+
     prototype = TorchVisionKVPrototype(config)
     prototype.run_demo()
     return 0

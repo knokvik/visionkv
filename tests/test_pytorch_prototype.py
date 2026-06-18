@@ -10,8 +10,11 @@ from visionkv.pytorch_prototype import (
     TorchVisionKVPrototype,
     format_bytes,
     megabytes_to_numel,
+    parse_int_csv,
     resolve_prefetch_block_count,
+    recommend_prefetch_block_count,
     should_use_non_blocking_copy,
+    TransferReport,
     torch_available,
 )
 
@@ -41,6 +44,29 @@ class HelperTests(unittest.TestCase):
     def test_resolve_prefetch_block_count_rejects_non_positive_requests(self) -> None:
         with self.assertRaises(ValueError):
             resolve_prefetch_block_count(10, 0)
+
+    def test_parse_int_csv(self) -> None:
+        self.assertEqual(parse_int_csv("1, 2,4"), [1, 2, 4])
+
+    def test_parse_int_csv_requires_values(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_int_csv(" , ")
+
+    def test_recommend_prefetch_block_count_chooses_largest_eligible_hot_set(self) -> None:
+        reports = [
+            TransferReport("cpu->cuda", 256 * 1024 * 1024, 0.5, 22.26, 0.35, True, 1, False),
+            TransferReport("cpu->cuda", 512 * 1024 * 1024, 0.85, 44.00, 0.30, True, 2, False),
+            TransferReport("cpu->cuda", 1024 * 1024 * 1024, 1.22, 87.49, 0.31, True, 4, False),
+        ]
+
+        recommendation = recommend_prefetch_block_count(reports, latency_budget_ms=50.0)
+        self.assertEqual(recommendation.recommended_block_count, 2)
+        self.assertEqual(recommendation.recommended_bytes, 512 * 1024 * 1024)
+
+    def test_recommend_prefetch_block_count_requires_positive_budget(self) -> None:
+        reports = [TransferReport("cpu->cuda", 1, 0.1, 1.0, 0.1, True, 1, False)]
+        with self.assertRaises(ValueError):
+            recommend_prefetch_block_count(reports, latency_budget_ms=0.0)
 
 
 @unittest.skipUnless(torch_available(), "PyTorch is not installed")
