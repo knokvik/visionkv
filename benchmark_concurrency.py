@@ -75,11 +75,14 @@ def create_dummy_image(size: int = 448):
 def build_prompts(n: int, image):
     """Build n multimodal prompt dicts for vLLM offline generation."""
     prompts = []
-    long_context = "This is a long context test. " * 600  # ~3600 words
+    # Generate a prompt of roughly 2500 words (~2600 tokens), leaving plenty of room 
+    # for the 100 output tokens and the 576 image tokens under the 4096 limit.
+    base_text = "This is a long context test to fill up the KV cache. "
+    long_prompt = base_text * 350
     for i in range(n):
         question = PROMPT_QUESTIONS[i % len(PROMPT_QUESTIONS)]
         prompts.append({
-            "prompt": f"USER: <image>\n{long_context}\n{question}\nASSISTANT:",
+            "prompt": f"USER: <image>\n{long_prompt}\n{question}\nASSISTANT:",
             "multi_modal_data": {"image": image},
         })
     return prompts
