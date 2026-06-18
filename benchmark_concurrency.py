@@ -39,7 +39,7 @@ import traceback
 # Constants
 # ---------------------------------------------------------------------------
 
-BATCH_SIZES = [5, 10, 15, 20, 25, 30, 35, 40]
+BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8]
 
 PROMPT_QUESTIONS = [
     "Describe every detail you can see in this image.",
@@ -75,10 +75,11 @@ def create_dummy_image(size: int = 448):
 def build_prompts(n: int, image):
     """Build n multimodal prompt dicts for vLLM offline generation."""
     prompts = []
+    long_context = "This is a long context test. " * 600  # ~3600 words
     for i in range(n):
         question = PROMPT_QUESTIONS[i % len(PROMPT_QUESTIONS)]
         prompts.append({
-            "prompt": f"USER: <image>\n{question}\nASSISTANT:",
+            "prompt": f"USER: <image>\n{long_context}\n{question}\nASSISTANT:",
             "multi_modal_data": {"image": image},
         })
     return prompts
@@ -385,10 +386,10 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100,
                         dest="max_tokens",
                         help="Output tokens per request")
-    parser.add_argument("--gpu-mem-util", type=float, default=0.50,
+    parser.add_argument("--gpu-mem-util", type=float, default=0.25,
                         dest="gpu_mem_util",
                         help="GPU memory utilization (lower = tighter KV budget)")
-    parser.add_argument("--max-batch", type=int, default=40,
+    parser.add_argument("--max-batch", type=int, default=8,
                         dest="max_batch",
                         help="Largest batch size to attempt")
     parser.add_argument("--hot-prefetch-block-count", type=int, default=2,
