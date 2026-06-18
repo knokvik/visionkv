@@ -34,6 +34,7 @@ except ImportError as exc:  # pragma: no cover - exercised on the GPU host
 
 
 LOGGER = logging.getLogger("visionkv.live_integration")
+SNAPSHOT_SCHEMA_VERSION = 2
 
 
 def _extract_prompt_text(prompt: Any) -> str:
@@ -392,6 +393,7 @@ class VisionKVPlugin:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "baseline_cuda_reserved_mib": _bytes_to_mib(self.baseline_cuda_reserved_bytes),
             "peak_cuda_reserved_mib": _bytes_to_mib(self.peak_cuda_reserved_bytes),
             "requests": self.metadata_store.snapshot(),

@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -49,7 +52,7 @@ def print_snapshot(label: str, payload: Any) -> None:
 
 
 class DeviceMemoryMonitor:
-    """Poll total device VRAM via NVML from outside the vLLM worker process."""
+    """Poll total device VRAM from outside the vLLM worker process."""
 
     def __init__(self, device_index: int, interval_s: float = 0.02) -> None:
         self.device_index = device_index
@@ -59,10 +62,11 @@ class DeviceMemoryMonitor:
         self._baseline_bytes = 0
         self._peak_bytes = 0
         self._handle: Any | None = None
+        self._backend = "unavailable"
 
     @property
     def available(self) -> bool:
-        return pynvml is not None
+        return self._backend != "unavailable"
 
     @property
     def baseline_bytes(self) -> int:
@@ -72,6 +76,10 @@ class DeviceMemoryMonitor:
     def peak_bytes(self) -> int:
         return self._peak_bytes
 
+    @property
+    def backend(self) -> str:
+        return self._backend
+
     def reset_baseline(self) -> int:
         current = self.read_used_bytes()
         self._baseline_bytes = current
@@ -79,29 +87,55 @@ class DeviceMemoryMonitor:
         return current
 
     def initialize(self) -> None:
-        if pynvml is None:
-            return
-        pynvml.nvmlInit()
-        self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
+        if pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
+                self._backend = "pynvml"
+            except Exception:
+                LOGGER.warning("Failed to initialize pynvml backend", exc_info=True)
+                self._handle = None
+
+        if self._backend == "unavailable" and shutil.which("nvidia-smi"):
+            self._backend = "nvidia-smi"
+
         self._baseline_bytes = self.read_used_bytes()
         self._peak_bytes = self._baseline_bytes
 
     def shutdown(self) -> None:
-        if pynvml is None:
-            return
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            LOGGER.debug("NVML shutdown failed", exc_info=True)
+        if self._backend == "pynvml" and pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                LOGGER.debug("NVML shutdown failed", exc_info=True)
 
     def read_used_bytes(self) -> int:
-        if pynvml is None or self._handle is None:
-            return 0
-        info = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
-        return int(info.used)
+        if self._backend == "pynvml" and pynvml is not None and self._handle is not None:
+            info = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+            return int(info.used)
+        if self._backend == "nvidia-smi":
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        f"--id={self.device_index}",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                value = result.stdout.strip().splitlines()[0]
+                return int(value) * 1024 * 1024
+            except Exception:
+                LOGGER.warning("Failed to read GPU memory from nvidia-smi", exc_info=True)
+                self._backend = "unavailable"
+                return 0
+        return 0
 
     def start(self) -> None:
-        if pynvml is None or self._handle is None:
+        if self._backend == "unavailable":
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._poll, daemon=True)
@@ -120,9 +154,25 @@ class DeviceMemoryMonitor:
             try:
                 self._peak_bytes = max(self._peak_bytes, self.read_used_bytes())
             except Exception:
-                LOGGER.debug("NVML poll failed", exc_info=True)
+                LOGGER.debug("GPU memory poll failed", exc_info=True)
                 return
             time.sleep(self.interval_s)
+
+
+def detect_repo_revision() -> str:
+    head_path = Path(".git/HEAD")
+    try:
+        head_contents = head_path.read_text().strip()
+    except OSError:
+        return "unknown"
+
+    if head_contents.startswith("ref: "):
+        ref_path = Path(".git") / head_contents.split(" ", 1)[1]
+        try:
+            return ref_path.read_text().strip()[:12]
+        except OSError:
+            return head_contents
+    return head_contents[:12]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -160,6 +210,8 @@ def main() -> int:
         interval_s=max(args.nvml_poll_ms, 1.0) / 1000.0,
     )
     memory_monitor.initialize()
+    print(f"VisionKV revision: {detect_repo_revision()}")
+    print(f"GPU memory monitor backend: {memory_monitor.backend}")
 
     image = build_dummy_image(args.image_size)
     llm = LLM(
@@ -179,6 +231,7 @@ def main() -> int:
         background_prefetch_remainder=not args.disable_background_prefetch_remainder,
     )
     plugin = VisionKVPlugin(llm, policy=policy).install()
+    print(f"VisionKV snapshot schema: {plugin.snapshot()['schema_version']}")
 
     if torch.cuda.is_initialized():
         torch.cuda.reset_peak_memory_stats()
@@ -227,11 +280,14 @@ def main() -> int:
 
         print("Follow-up generated text:")
         print(followup_outputs[0].outputs[0].text)
-        print_snapshot("VisionKV snapshot:", plugin.snapshot())
+        final_snapshot = plugin.snapshot()
+        print_snapshot("VisionKV snapshot:", final_snapshot)
         print(
             "Peak device VRAM across both requests: "
             f"{format_vram_mib(memory_monitor.peak_bytes)}"
         )
+        if memory_monitor.backend == "unavailable":
+            print("Warning: GPU memory monitor backend unavailable; VRAM numbers may be zero.")
         return 0
     finally:
         memory_monitor.stop()

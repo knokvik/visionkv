@@ -171,6 +171,7 @@ class LiveIntegrationTests(unittest.TestCase):
         self.assertEqual(sorted(state.background_prefetched_block_ids), [2, 3, 4, 5])
         self.assertFalse(state.offloaded_block_ids)
         self.assertFalse(state.background_prefetch_pending)
+        self.assertEqual(plugin.snapshot()["schema_version"], 2)
 
 
 if __name__ == "__main__":
