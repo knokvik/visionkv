@@ -10,6 +10,7 @@ from visionkv.pytorch_prototype import (
     TorchVisionKVPrototype,
     format_bytes,
     megabytes_to_numel,
+    should_use_non_blocking_copy,
     torch_available,
 )
 
@@ -21,6 +22,13 @@ class HelperTests(unittest.TestCase):
 
     def test_format_bytes(self) -> None:
         self.assertEqual(format_bytes(2 * 1024 * 1024), "2.0MB")
+
+    def test_non_blocking_copy_is_used_for_cpu_cuda_transfers_only(self) -> None:
+        self.assertTrue(should_use_non_blocking_copy("cuda", "cpu", True))
+        self.assertTrue(should_use_non_blocking_copy("cpu", "cuda", True))
+        self.assertFalse(should_use_non_blocking_copy("cuda", "cuda", True))
+        self.assertFalse(should_use_non_blocking_copy("cpu", "cpu", True))
+        self.assertFalse(should_use_non_blocking_copy("cuda", "cpu", False))
 
 
 @unittest.skipUnless(torch_available(), "PyTorch is not installed")

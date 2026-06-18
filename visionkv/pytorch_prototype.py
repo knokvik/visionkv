@@ -35,6 +35,18 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
 
 
+def should_use_non_blocking_copy(
+    source: str,
+    destination: str,
+    supports_true_async_copy: bool,
+) -> bool:
+    """Return whether this transfer path can use a non-blocking copy."""
+
+    if not supports_true_async_copy:
+        return False
+    return {source, destination} == {"cpu", "cuda"}
+
+
 @dataclass
 class PrototypeConfig:
     num_vision_blocks: int = 10
@@ -198,16 +210,24 @@ class TorchVisionKVPrototype:
                 blocks_moved=0,
             )
 
-        non_blocking = self.devices.supports_true_async_copy and destination == "cpu"
+        source = blocks[0].location
+        non_blocking = should_use_non_blocking_copy(
+            source=source,
+            destination=destination,
+            supports_true_async_copy=self.devices.supports_true_async_copy,
+        )
         start_time = time.perf_counter()
         transferred: List[tuple[TensorBlock, "torch.Tensor"]] = []
 
-        if self.transfer_stream is not None and destination == "cpu":
+        if self.transfer_stream is not None and non_blocking:
             with torch.cuda.stream(self.transfer_stream):
                 for block in blocks:
-                    cpu_tensor = torch.empty_like(block.tensor, device="cpu", pin_memory=True)
-                    cpu_tensor.copy_(block.tensor, non_blocking=True)
-                    transferred.append((block, cpu_tensor))
+                    transferred.append(
+                        (
+                            block,
+                            self._copy_tensor(block.tensor, destination, non_blocking=True),
+                        )
+                    )
         else:
             for block in blocks:
                 transferred.append((block, self._copy_tensor(block.tensor, destination, non_blocking)))
@@ -222,7 +242,7 @@ class TorchVisionKVPrototype:
 
         total_ms = (time.perf_counter() - start_time) * 1000
         return TransferReport(
-            direction=f"{blocks[0].location}->{destination}",
+            direction=f"{source}->{destination}",
             total_bytes=sum(block.size_bytes for block in blocks),
             launch_ms=launch_ms,
             total_ms=total_ms,
