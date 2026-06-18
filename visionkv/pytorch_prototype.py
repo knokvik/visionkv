@@ -71,6 +71,7 @@ class TensorBlock:
     size_mb: int
     location: str
     tensor: "torch.Tensor"
+    cpu_staging_tensor: Optional["torch.Tensor"] = None
 
     @property
     def size_bytes(self) -> int:
@@ -86,6 +87,7 @@ class TransferReport:
     overlapped_compute_ms: float
     used_non_blocking: bool
     blocks_moved: int
+    used_staging_pool: bool
 
 
 class TorchVisionKVPrototype:
@@ -104,6 +106,7 @@ class TorchVisionKVPrototype:
         )
         self.blocks: Dict[int, TensorBlock] = {}
         self.next_logical_id = 0
+        self.staging_pool_enabled = self.devices.accelerator == "cuda"
 
     @staticmethod
     def _select_runtime_devices(preferred_device: str) -> RuntimeDevices:
@@ -132,12 +135,20 @@ class TorchVisionKVPrototype:
     def allocate_block(self, modality: str, size_mb: int) -> TensorBlock:
         numel = megabytes_to_numel(size_mb)
         tensor = torch.empty(numel, dtype=torch.float32, device=self.devices.accelerator)
+        cpu_staging_tensor = None
+        if self.staging_pool_enabled and modality == "vision":
+            cpu_staging_tensor = torch.empty_like(
+                tensor,
+                device="cpu",
+                pin_memory=True,
+            )
         block = TensorBlock(
             logical_id=self.next_logical_id,
             modality=modality,
             size_mb=size_mb,
             location=self.devices.accelerator,
             tensor=tensor,
+            cpu_staging_tensor=cpu_staging_tensor,
         )
         self.blocks[block.logical_id] = block
         self.next_logical_id += 1
@@ -208,6 +219,7 @@ class TorchVisionKVPrototype:
                 overlapped_compute_ms=0.0,
                 used_non_blocking=False,
                 blocks_moved=0,
+                used_staging_pool=False,
             )
 
         source = blocks[0].location
@@ -218,14 +230,22 @@ class TorchVisionKVPrototype:
         )
         start_time = time.perf_counter()
         transferred: List[tuple[TensorBlock, "torch.Tensor"]] = []
+        used_staging_pool = False
 
         if self.transfer_stream is not None and non_blocking:
             with torch.cuda.stream(self.transfer_stream):
                 for block in blocks:
+                    destination_tensor = self._get_destination_tensor(
+                        block,
+                        destination,
+                        non_blocking,
+                    )
+                    if destination == "cpu" and destination_tensor is block.cpu_staging_tensor:
+                        used_staging_pool = True
                     transferred.append(
                         (
                             block,
-                            self._copy_tensor(block.tensor, destination, non_blocking=True),
+                            destination_tensor,
                         )
                     )
         else:
@@ -249,7 +269,20 @@ class TorchVisionKVPrototype:
             overlapped_compute_ms=overlapped_compute_ms,
             used_non_blocking=non_blocking,
             blocks_moved=len(blocks),
+            used_staging_pool=used_staging_pool,
         )
+
+    def _get_destination_tensor(
+        self,
+        block: TensorBlock,
+        destination: str,
+        non_blocking: bool,
+    ) -> "torch.Tensor":
+        if destination == "cpu" and block.cpu_staging_tensor is not None:
+            block.cpu_staging_tensor.copy_(block.tensor, non_blocking=non_blocking)
+            return block.cpu_staging_tensor
+
+        return self._copy_tensor(block.tensor, destination, non_blocking)
 
     def _copy_tensor(
         self, tensor: "torch.Tensor", destination: str, non_blocking: bool
@@ -312,7 +345,8 @@ class TorchVisionKVPrototype:
             f"launch_ms={report.launch_ms:.2f} "
             f"total_ms={report.total_ms:.2f} "
             f"overlap_probe_ms={report.overlapped_compute_ms:.2f} "
-            f"non_blocking={report.used_non_blocking}"
+            f"non_blocking={report.used_non_blocking} "
+            f"staging_pool={report.used_staging_pool}"
         )
 
 

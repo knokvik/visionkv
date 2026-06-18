@@ -52,6 +52,20 @@ class PrototypeRuntimeTests(unittest.TestCase):
         self.assertEqual(block.modality, "vision")
         self.assertEqual(block.location, "cpu")
 
+    def test_cpu_runtime_does_not_create_pinned_staging_pool(self) -> None:
+        prototype = TorchVisionKVPrototype(
+            PrototypeConfig(
+                num_vision_blocks=1,
+                vision_block_mb=1,
+                num_text_blocks=1,
+                text_block_mb=1,
+                overlap_matmul_dim=16,
+                preferred_device="cpu",
+            )
+        )
+        block = prototype.allocate_block("vision", 1)
+        self.assertIsNone(block.cpu_staging_tensor)
+
 
 if __name__ == "__main__":
     unittest.main()
