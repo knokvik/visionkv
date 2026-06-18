@@ -34,7 +34,7 @@ except ImportError as exc:  # pragma: no cover - exercised on the GPU host
 
 
 LOGGER = logging.getLogger("visionkv.live_integration")
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 
 
 def _extract_prompt_text(prompt: Any) -> str:
@@ -76,6 +76,203 @@ def _bytes_to_mib(num_bytes: int) -> float:
     return num_bytes / (1024 * 1024)
 
 
+
+class TensorOffloadManager:
+    """Manages physical CPU/GPU tensor migration for KV cache blocks.
+
+    Uses a dedicated CUDA stream and pinned CPU memory to perform
+    asynchronous, zero-stall transfers of vision KV cache blocks.
+    """
+
+    def __init__(self, logger: logging.Logger | None = None) -> None:
+        self.logger = logger or LOGGER
+        self._cuda_available = False
+        self._stream: Any | None = None
+        self._cpu_store: dict[str, dict[int, torch.Tensor]] = {}
+        self._transfer_times: list[float] = []
+        self._total_offload_bytes = 0
+        self._total_prefetch_bytes = 0
+        self._initialize()
+
+    def _initialize(self) -> None:
+        try:
+            if torch.cuda.is_available():
+                self._cuda_available = True
+                self._stream = torch.cuda.Stream()
+                self.logger.info(
+                    "TensorOffloadManager initialized with dedicated CUDA stream"
+                )
+        except Exception:
+            self.logger.debug("CUDA not available for tensor offload", exc_info=True)
+
+    @property
+    def available(self) -> bool:
+        return self._cuda_available
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        return {
+            "cuda_available": self._cuda_available,
+            "total_offload_bytes": self._total_offload_bytes,
+            "total_prefetch_bytes": self._total_prefetch_bytes,
+            "total_offload_mib": round(_bytes_to_mib(self._total_offload_bytes), 2),
+            "total_prefetch_mib": round(_bytes_to_mib(self._total_prefetch_bytes), 2),
+            "transfer_count": len(self._transfer_times),
+            "avg_transfer_ms": (
+                round(sum(self._transfer_times) / len(self._transfer_times) * 1000, 2)
+                if self._transfer_times
+                else 0.0
+            ),
+            "max_transfer_ms": (
+                round(max(self._transfer_times) * 1000, 2)
+                if self._transfer_times
+                else 0.0
+            ),
+        }
+
+    def offload_kv_blocks_to_cpu(
+        self,
+        request_id: str,
+        kv_caches: list[torch.Tensor],
+        block_ids: list[int],
+    ) -> bool:
+        """Move KV cache blocks from GPU to pinned CPU memory.
+
+        Args:
+            request_id: Unique identifier for this request's storage.
+            kv_caches: List of KV cache tensors (one per layer),
+                       shaped [num_blocks, block_size, num_heads, head_dim].
+            block_ids: Logical block indices to offload.
+
+        Returns:
+            True if offload succeeded.
+        """
+        if not self._cuda_available or not kv_caches:
+            return False
+
+        t0 = time.perf_counter()
+        cpu_blocks: dict[int, torch.Tensor] = {}
+
+        try:
+            with torch.cuda.stream(self._stream):
+                for block_id in block_ids:
+                    # Stack all layers for this block into a single tensor
+                    layer_slices = []
+                    for kv_cache in kv_caches:
+                        if block_id < kv_cache.shape[0]:
+                            layer_slices.append(kv_cache[block_id])
+                    if not layer_slices:
+                        continue
+                    stacked = torch.stack(layer_slices)
+                    # Transfer to pinned CPU memory for fast re-upload
+                    cpu_tensor = stacked.to(
+                        device="cpu",
+                        non_blocking=True,
+                    ).pin_memory()
+                    cpu_blocks[block_id] = cpu_tensor
+                    self._total_offload_bytes += cpu_tensor.nelement() * cpu_tensor.element_size()
+
+            # Synchronize the offload stream to ensure data is on CPU
+            self._stream.synchronize()
+
+            # Zero out the GPU blocks to allow vLLM's allocator to reclaim
+            with torch.cuda.stream(self._stream):
+                for block_id in block_ids:
+                    for kv_cache in kv_caches:
+                        if block_id < kv_cache.shape[0]:
+                            kv_cache[block_id].zero_()
+
+            self._stream.synchronize()
+
+        except Exception:
+            self.logger.warning(
+                "Failed to offload KV blocks for request=%s",
+                request_id,
+                exc_info=True,
+            )
+            return False
+
+        self._cpu_store[request_id] = cpu_blocks
+        elapsed = time.perf_counter() - t0
+        self._transfer_times.append(elapsed)
+        self.logger.info(
+            "Tensor offload request=%s blocks=%s elapsed_ms=%.2f bytes=%d",
+            request_id,
+            block_ids,
+            elapsed * 1000,
+            sum(t.nelement() * t.element_size() for t in cpu_blocks.values()),
+        )
+        return True
+
+    def prefetch_kv_blocks_to_gpu(
+        self,
+        request_id: str,
+        kv_caches: list[torch.Tensor],
+        block_ids: list[int],
+    ) -> float:
+        """Restore KV cache blocks from pinned CPU memory to GPU.
+
+        Args:
+            request_id: Unique identifier for this request's storage.
+            kv_caches: List of KV cache tensors on GPU.
+            block_ids: Logical block indices to prefetch.
+
+        Returns:
+            Elapsed time in seconds for the prefetch operation.
+        """
+        cpu_blocks = self._cpu_store.get(request_id, {})
+        if not cpu_blocks or not self._cuda_available:
+            return 0.0
+
+        t0 = time.perf_counter()
+
+        try:
+            with torch.cuda.stream(self._stream):
+                for block_id in block_ids:
+                    cpu_tensor = cpu_blocks.get(block_id)
+                    if cpu_tensor is None:
+                        continue
+                    # cpu_tensor is [num_layers, block_size, num_heads, head_dim]
+                    for layer_idx, kv_cache in enumerate(kv_caches):
+                        if layer_idx < cpu_tensor.shape[0] and block_id < kv_cache.shape[0]:
+                            kv_cache[block_id].copy_(cpu_tensor[layer_idx], non_blocking=True)
+                    self._total_prefetch_bytes += (
+                        cpu_tensor.nelement() * cpu_tensor.element_size()
+                    )
+
+            self._stream.synchronize()
+
+        except Exception:
+            self.logger.warning(
+                "Failed to prefetch KV blocks for request=%s",
+                request_id,
+                exc_info=True,
+            )
+            return 0.0
+
+        # Remove restored blocks from CPU store
+        for block_id in block_ids:
+            cpu_blocks.pop(block_id, None)
+        if not cpu_blocks:
+            self._cpu_store.pop(request_id, None)
+
+        elapsed = time.perf_counter() - t0
+        self._transfer_times.append(elapsed)
+        self.logger.info(
+            "Tensor prefetch request=%s blocks=%s elapsed_ms=%.2f",
+            request_id,
+            block_ids,
+            elapsed * 1000,
+        )
+        return elapsed
+
+    def has_cpu_blocks(self, request_id: str) -> bool:
+        return bool(self._cpu_store.get(request_id))
+
+    def cleanup_request(self, request_id: str) -> None:
+        self._cpu_store.pop(request_id, None)
+
+
 @dataclass
 class VisionKVRequestState:
     external_request_id: str
@@ -97,6 +294,9 @@ class VisionKVRequestState:
     offload_count: int = 0
     prefetch_count: int = 0
     background_prefetch_count: int = 0
+    offload_elapsed_ms: float = 0.0
+    prefetch_elapsed_ms: float = 0.0
+    background_prefetch_elapsed_ms: float = 0.0
 
     @property
     def is_offloaded(self) -> bool:
@@ -236,6 +436,11 @@ class VisionKVMetadataStore:
                 "offload_count": state.offload_count,
                 "prefetch_count": state.prefetch_count,
                 "background_prefetch_count": state.background_prefetch_count,
+                "offload_elapsed_ms": round(state.offload_elapsed_ms, 2),
+                "prefetch_elapsed_ms": round(state.prefetch_elapsed_ms, 2),
+                "background_prefetch_elapsed_ms": round(
+                    state.background_prefetch_elapsed_ms, 2
+                ),
             }
             for state in self.iter_states()
         ]
@@ -244,11 +449,10 @@ class VisionKVMetadataStore:
 class LiveVisionKVController:
     """Applies the live offload/prefetch policy over tracked request metadata.
 
-    This controller is intentionally coordination-only. Public pip-installed
-    vLLM APIs do not currently expose a safe, request-scoped KV block migration
-    surface for external plugins, so the controller tracks the intended
-    offload/prefetch lifecycle and emits observability hooks without claiming
-    to move private KV tensors directly.
+    When a TensorOffloadManager is provided and CUDA is available, this
+    controller will physically move KV cache block data between GPU and CPU.
+    Otherwise, it tracks the intended offload/prefetch lifecycle and emits
+    observability hooks.
     """
 
     def __init__(
@@ -256,10 +460,14 @@ class LiveVisionKVController:
         policy: VisionKVPolicy,
         logger: logging.Logger,
         offload_after_generation_tokens: int = 50,
+        tensor_manager: TensorOffloadManager | None = None,
+        kv_cache_resolver: Callable[[], list[torch.Tensor]] | None = None,
     ) -> None:
         self.policy = policy
         self.logger = logger
         self.offload_after_generation_tokens = offload_after_generation_tokens
+        self.tensor_manager = tensor_manager
+        self._kv_cache_resolver = kv_cache_resolver
 
     def maybe_mark_for_offload(self, state: VisionKVRequestState) -> bool:
         if state.pending_offload or state.is_offloaded:
@@ -273,18 +481,34 @@ class LiveVisionKVController:
     def offload_vision_blocks(self, state: VisionKVRequestState) -> bool:
         if state.is_offloaded or not state.vision_block_ids:
             return False
+
+        request_key = state.internal_request_id or state.external_request_id
+        t0 = time.perf_counter()
+
+        # Attempt physical tensor offload if manager is available
+        if self.tensor_manager is not None and self.tensor_manager.available:
+            kv_caches = self._resolve_kv_caches()
+            if kv_caches:
+                self.tensor_manager.offload_kv_blocks_to_cpu(
+                    request_id=request_key,
+                    kv_caches=kv_caches,
+                    block_ids=state.vision_block_ids,
+                )
+
         state.pending_offload = False
         state.offloaded_block_ids = set(state.vision_block_ids)
         state.hot_prefetched_block_ids.clear()
         state.background_prefetched_block_ids.clear()
         state.background_prefetch_pending = False
         state.offload_count += 1
+        state.offload_elapsed_ms = (time.perf_counter() - t0) * 1000
         state.last_updated_at = time.time()
         self.logger.info(
-            "Offloaded request=%s blocks=%s generated_tokens=%s",
-            state.internal_request_id or state.external_request_id,
+            "Offloaded request=%s blocks=%s generated_tokens=%s elapsed_ms=%.2f",
+            request_key,
             state.vision_block_ids,
             state.generated_tokens,
+            state.offload_elapsed_ms,
         )
         return True
 
@@ -296,6 +520,27 @@ class LiveVisionKVController:
         ]
         if not hot_blocks:
             return False
+
+        request_key = state.internal_request_id or state.external_request_id
+
+        # Attempt physical tensor prefetch if manager is available
+        if self.tensor_manager is not None and self.tensor_manager.available:
+            kv_caches = self._resolve_kv_caches()
+            if kv_caches:
+                elapsed = self.tensor_manager.prefetch_kv_blocks_to_gpu(
+                    request_id=request_key,
+                    kv_caches=kv_caches,
+                    block_ids=hot_blocks,
+                )
+                state.prefetch_elapsed_ms = elapsed * 1000
+                budget_ms = self.policy.flashback_budget_ms
+                if state.prefetch_elapsed_ms > budget_ms:
+                    self.logger.warning(
+                        "Hot prefetch exceeded budget: %.2f ms > %.2f ms",
+                        state.prefetch_elapsed_ms,
+                        budget_ms,
+                    )
+
         state.offloaded_block_ids.difference_update(hot_blocks)
         state.hot_prefetched_block_ids.update(hot_blocks)
         state.prefetch_count += 1
@@ -304,10 +549,12 @@ class LiveVisionKVController:
         )
         state.last_updated_at = time.time()
         self.logger.info(
-            "Prefetched hot set for request=%s hot_blocks=%s remaining_offloaded=%s",
-            state.internal_request_id or state.external_request_id,
+            "Prefetched hot set for request=%s hot_blocks=%s remaining_offloaded=%s "
+            "elapsed_ms=%.2f",
+            request_key,
             hot_blocks,
             sorted(state.offloaded_block_ids),
+            state.prefetch_elapsed_ms,
         )
         return True
 
@@ -318,17 +565,41 @@ class LiveVisionKVController:
         if not remaining_blocks:
             state.background_prefetch_pending = False
             return False
+
+        request_key = state.internal_request_id or state.external_request_id
+
+        # Attempt physical tensor prefetch if manager is available
+        if self.tensor_manager is not None and self.tensor_manager.available:
+            kv_caches = self._resolve_kv_caches()
+            if kv_caches:
+                elapsed = self.tensor_manager.prefetch_kv_blocks_to_gpu(
+                    request_id=request_key,
+                    kv_caches=kv_caches,
+                    block_ids=remaining_blocks,
+                )
+                state.background_prefetch_elapsed_ms = elapsed * 1000
+
         state.offloaded_block_ids.clear()
         state.background_prefetched_block_ids.update(remaining_blocks)
         state.background_prefetch_pending = False
         state.background_prefetch_count += 1
         state.last_updated_at = time.time()
         self.logger.info(
-            "Background-prefetched request=%s cold_blocks=%s",
-            state.internal_request_id or state.external_request_id,
+            "Background-prefetched request=%s cold_blocks=%s elapsed_ms=%.2f",
+            request_key,
             remaining_blocks,
+            state.background_prefetch_elapsed_ms,
         )
         return True
+
+    def _resolve_kv_caches(self) -> list[torch.Tensor]:
+        """Resolve the live KV cache tensors from the vLLM engine."""
+        if self._kv_cache_resolver is not None:
+            try:
+                return self._kv_cache_resolver()
+            except Exception:
+                self.logger.debug("KV cache resolver failed", exc_info=True)
+        return []
 
 
 class VisionKVPlugin:
@@ -350,16 +621,23 @@ class VisionKVPlugin:
         )
         self.block_size_tokens = block_size_tokens
         self.metadata_store = VisionKVMetadataStore()
+        self._llm_engine = self._resolve_llm_engine(engine_or_worker)
+        self._worker = self._resolve_worker(engine_or_worker)
+
+        # Create tensor offload manager and wire up KV cache resolver
+        self.tensor_manager = TensorOffloadManager(logger=LOGGER)
+        kv_cache_resolver = self._build_kv_cache_resolver()
+
         self.controller = LiveVisionKVController(
             policy=self.policy,
             logger=LOGGER,
             offload_after_generation_tokens=offload_after_generation_tokens,
+            tensor_manager=self.tensor_manager,
+            kv_cache_resolver=kv_cache_resolver,
         )
         self._patches: list[tuple[Any, str, Any]] = []
         self._installed = False
         self._lock = threading.RLock()
-        self._llm_engine = self._resolve_llm_engine(engine_or_worker)
-        self._worker = self._resolve_worker(engine_or_worker)
         self.peak_cuda_reserved_bytes = 0
         self.baseline_cuda_reserved_bytes = self._read_cuda_reserved_bytes()
 
@@ -396,6 +674,7 @@ class VisionKVPlugin:
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "baseline_cuda_reserved_mib": _bytes_to_mib(self.baseline_cuda_reserved_bytes),
             "peak_cuda_reserved_mib": _bytes_to_mib(self.peak_cuda_reserved_bytes),
+            "tensor_offload_stats": self.tensor_manager.stats,
             "requests": self.metadata_store.snapshot(),
         }
 
@@ -639,3 +918,68 @@ class VisionKVPlugin:
         if isinstance(worker, WorkerBase):
             return worker
         return None
+
+    def _build_kv_cache_resolver(self) -> Callable[[], list[torch.Tensor]]:
+        """Build a callable that navigates vLLM's internal objects to find live KV cache tensors."""
+        def resolver() -> list[torch.Tensor]:
+            if self._worker is None:
+                return []
+
+            # Check if self._worker has gpu_cache
+            gpu_cache = getattr(self._worker, "gpu_cache", None)
+            if gpu_cache is not None:
+                if isinstance(gpu_cache, list):
+                    flat_caches = []
+                    for item in gpu_cache:
+                        if isinstance(item, torch.Tensor):
+                            flat_caches.append(item)
+                        elif isinstance(item, (list, tuple)):
+                            for t in item:
+                                if isinstance(t, torch.Tensor):
+                                    flat_caches.append(t)
+                    if flat_caches:
+                        return flat_caches
+
+            # Check if model_runner has gpu_cache or kv_caches
+            model_runner = getattr(self._worker, "model_runner", None)
+            if model_runner is not None:
+                for attr_name in ("gpu_cache", "kv_caches", "kv_cache"):
+                    caches = getattr(model_runner, attr_name, None)
+                    if caches is not None:
+                        if isinstance(caches, list):
+                            flat_caches = []
+                            for item in caches:
+                                if isinstance(item, torch.Tensor):
+                                    flat_caches.append(item)
+                                elif isinstance(item, (list, tuple)):
+                                    for t in item:
+                                        if isinstance(t, torch.Tensor):
+                                            flat_caches.append(t)
+                            if flat_caches:
+                                return flat_caches
+                        elif isinstance(caches, torch.Tensor):
+                            return [caches]
+
+            # Check cache_engine for gpu_cache
+            cache_engine = getattr(self._worker, "cache_engine", None)
+            if cache_engine is not None:
+                caches = getattr(cache_engine, "gpu_cache", None)
+                if caches is not None:
+                    if isinstance(caches, list):
+                        flat_caches = []
+                        for item in caches:
+                            if isinstance(item, torch.Tensor):
+                                flat_caches.append(item)
+                            elif isinstance(item, (list, tuple)):
+                                for t in item:
+                                    if isinstance(t, torch.Tensor):
+                                        flat_caches.append(t)
+                        if flat_caches:
+                            return flat_caches
+                    elif isinstance(caches, torch.Tensor):
+                        return [caches]
+
+            return []
+
+        return resolver
+
