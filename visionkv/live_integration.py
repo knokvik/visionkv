@@ -222,6 +222,7 @@ class VisionKVMetadataStore:
                 "external_request_id": state.external_request_id,
                 "internal_request_id": state.internal_request_id,
                 "generated_tokens": state.generated_tokens,
+                "pending_offload": state.pending_offload,
                 "vision_block_ids": list(state.vision_block_ids),
                 "hot_block_ids": list(state.hot_block_ids),
                 "cold_block_ids": list(state.cold_block_ids),
@@ -230,6 +231,10 @@ class VisionKVMetadataStore:
                 "background_prefetched_block_ids": sorted(
                     state.background_prefetched_block_ids
                 ),
+                "background_prefetch_pending": state.background_prefetch_pending,
+                "offload_count": state.offload_count,
+                "prefetch_count": state.prefetch_count,
+                "background_prefetch_count": state.background_prefetch_count,
             }
             for state in self.iter_states()
         ]
@@ -418,13 +423,8 @@ class VisionKVPlugin:
 
     def decode_step_hook(self, scheduler_output: Any) -> None:
         del scheduler_output  # only used as an execution boundary for now
+        self._advance_lifecycle()
         self._update_peak_vram()
-        for state in self.metadata_store.iter_states():
-            if state.pending_offload:
-                self.controller.offload_vision_blocks(state)
-                continue
-            if state.background_prefetch_pending and state.hot_prefetched_block_ids:
-                self.controller.continue_background_prefetch(state)
 
     def _patch_input_processor(self, engine: LLMEngine) -> None:
         input_processor = engine.input_processor
@@ -522,6 +522,7 @@ class VisionKVPlugin:
         def wrapped_step(*args: Any, **kwargs: Any) -> Any:
             outputs = original(*args, **kwargs)
             self._record_generation_progress(outputs)
+            self._advance_lifecycle()
             self._update_peak_vram()
             return outputs
 
@@ -571,6 +572,14 @@ class VisionKVPlugin:
                 state.generated_tokens = generated_tokens
                 state.last_updated_at = time.time()
                 self.controller.maybe_mark_for_offload(state)
+
+    def _advance_lifecycle(self) -> None:
+        for state in self.metadata_store.iter_states():
+            if state.pending_offload:
+                self.controller.offload_vision_blocks(state)
+                continue
+            if state.background_prefetch_pending and state.hot_prefetched_block_ids:
+                self.controller.continue_background_prefetch(state)
 
     @staticmethod
     def _extract_generated_token_count(request_output: Any) -> int | None:
