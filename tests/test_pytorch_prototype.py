@@ -10,6 +10,7 @@ from visionkv.pytorch_prototype import (
     TorchVisionKVPrototype,
     format_bytes,
     megabytes_to_numel,
+    resolve_prefetch_block_count,
     should_use_non_blocking_copy,
     torch_available,
 )
@@ -29,6 +30,17 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(should_use_non_blocking_copy("cuda", "cuda", True))
         self.assertFalse(should_use_non_blocking_copy("cpu", "cpu", True))
         self.assertFalse(should_use_non_blocking_copy("cuda", "cpu", False))
+
+    def test_resolve_prefetch_block_count_defaults_to_all_blocks(self) -> None:
+        self.assertEqual(resolve_prefetch_block_count(10, None), 10)
+
+    def test_resolve_prefetch_block_count_clamps_to_available_blocks(self) -> None:
+        self.assertEqual(resolve_prefetch_block_count(10, 2), 2)
+        self.assertEqual(resolve_prefetch_block_count(10, 20), 10)
+
+    def test_resolve_prefetch_block_count_rejects_non_positive_requests(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_prefetch_block_count(10, 0)
 
 
 @unittest.skipUnless(torch_available(), "PyTorch is not installed")

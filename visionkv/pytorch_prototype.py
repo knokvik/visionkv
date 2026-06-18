@@ -47,6 +47,16 @@ def should_use_non_blocking_copy(
     return {source, destination} == {"cpu", "cuda"}
 
 
+def resolve_prefetch_block_count(total_blocks: int, requested_blocks: Optional[int]) -> int:
+    """Clamp the requested hot-set size to the available number of blocks."""
+
+    if requested_blocks is None:
+        return total_blocks
+    if requested_blocks <= 0:
+        raise ValueError("prefetch_block_count must be positive when provided.")
+    return min(total_blocks, requested_blocks)
+
+
 @dataclass
 class PrototypeConfig:
     num_vision_blocks: int = 10
@@ -54,6 +64,8 @@ class PrototypeConfig:
     num_text_blocks: int = 50
     text_block_mb: int = 64
     text_eviction_threshold: int = 20
+    prefetch_block_count: Optional[int] = None
+    background_prefetch_remainder: bool = True
     overlap_matmul_dim: int = 1024
     preferred_device: str = "auto"
 
@@ -171,11 +183,10 @@ class TorchVisionKVPrototype:
             destination="cpu",
         )
 
-    def prefetch_vision_blocks(self) -> TransferReport:
-        return self._move_blocks(
-            self.get_blocks(modality="vision", location="cpu"),
-            destination=self.devices.accelerator,
-        )
+    def prefetch_vision_blocks(self, block_limit: Optional[int] = None) -> TransferReport:
+        cpu_vision_blocks = self.get_blocks(modality="vision", location="cpu")
+        selected_blocks = cpu_vision_blocks[: resolve_prefetch_block_count(len(cpu_vision_blocks), block_limit)]
+        return self._move_blocks(selected_blocks, destination=self.devices.accelerator)
 
     def run_demo(self) -> None:
         print("== VisionKV PyTorch Prototype ==")
@@ -205,9 +216,25 @@ class TorchVisionKVPrototype:
                 offload_report = self.offload_vision_blocks()
                 print(self._format_transfer_report(offload_report))
 
-        print("\nPhase 3: simulate a follow-up question about the image")
-        prefetch_report = self.prefetch_vision_blocks()
+        hot_prefetch_count = resolve_prefetch_block_count(
+            total_blocks=len(self.get_blocks(modality="vision", location="cpu")),
+            requested_blocks=self.config.prefetch_block_count,
+        )
+        print(
+            "\nPhase 3: simulate a follow-up question about the image "
+            f"(hot prefetch blocks={hot_prefetch_count})"
+        )
+        prefetch_report = self.prefetch_vision_blocks(block_limit=self.config.prefetch_block_count)
         print(self._format_transfer_report(prefetch_report))
+
+        remaining_cpu_blocks = self.get_blocks(modality="vision", location="cpu")
+        if remaining_cpu_blocks and self.config.background_prefetch_remainder:
+            print(
+                "\nPhase 4: continue background restore of remaining vision blocks "
+                f"(remaining_blocks={len(remaining_cpu_blocks)})"
+            )
+            background_report = self.prefetch_vision_blocks()
+            print(self._format_transfer_report(background_report))
 
     def _move_blocks(self, blocks: List[TensorBlock], destination: str) -> TransferReport:
         if not blocks:
@@ -357,6 +384,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-text-blocks", type=int, default=50)
     parser.add_argument("--text-block-mb", type=int, default=64)
     parser.add_argument("--text-eviction-threshold", type=int, default=20)
+    parser.add_argument("--prefetch-block-count", type=int)
+    parser.add_argument(
+        "--no-background-prefetch-remainder",
+        action="store_true",
+        help="Skip the follow-on restore of blocks not included in the initial hot prefetch.",
+    )
     parser.add_argument("--overlap-matmul-dim", type=int, default=1024)
     parser.add_argument("--preferred-device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     return parser
@@ -374,6 +407,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         num_text_blocks=args.num_text_blocks,
         text_block_mb=args.text_block_mb,
         text_eviction_threshold=args.text_eviction_threshold,
+        prefetch_block_count=args.prefetch_block_count,
+        background_prefetch_remainder=not args.no_background_prefetch_remainder,
         overlap_matmul_dim=args.overlap_matmul_dim,
         preferred_device=args.preferred_device,
     )
