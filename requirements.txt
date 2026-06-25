@@ -1,0 +1,17 @@
+# VisionKV — pinned dependencies for vLLM 0.23.0 integration
+# ==============================================================
+# Install with:
+#   pip install -r requirements.txt
+#
+# NOTE: torch requires the CUDA 12.8 variant.  On a machine without GPUs
+# you can swap the torch line for the CPU-only build instead.
+#
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+
+vllm==0.23.0
+torch==2.8.0
+numpy==1.26.4
+scipy==1.11.4
+rfc3987
+Pillow
+pynvml

@@ -76,6 +76,22 @@ def _bytes_to_mib(num_bytes: int) -> float:
     return num_bytes / (1024 * 1024)
 
 
+def _flatten_cache_tensors(caches: Any) -> list[torch.Tensor]:
+    """Recursively extract leaf tensors from a potentially nested cache structure."""
+    if caches is None:
+        return []
+    if isinstance(caches, torch.Tensor):
+        return [caches]
+    if isinstance(caches, (list, tuple)):
+        flat: list[torch.Tensor] = []
+        for item in caches:
+            if isinstance(item, torch.Tensor):
+                flat.append(item)
+            elif isinstance(item, (list, tuple)):
+                flat.extend(_flatten_cache_tensors(item))
+        return flat
+    return []
+
 
 class TensorOffloadManager:
     """Manages physical CPU/GPU tensor migration for KV cache blocks.
@@ -927,57 +943,24 @@ class VisionKVPlugin:
 
             # Check if self._worker has gpu_cache
             gpu_cache = getattr(self._worker, "gpu_cache", None)
-            if gpu_cache is not None:
-                if isinstance(gpu_cache, list):
-                    flat_caches = []
-                    for item in gpu_cache:
-                        if isinstance(item, torch.Tensor):
-                            flat_caches.append(item)
-                        elif isinstance(item, (list, tuple)):
-                            for t in item:
-                                if isinstance(t, torch.Tensor):
-                                    flat_caches.append(t)
-                    if flat_caches:
-                        return flat_caches
+            flat = _flatten_cache_tensors(gpu_cache)
+            if flat:
+                return flat
 
             # Check if model_runner has gpu_cache or kv_caches
             model_runner = getattr(self._worker, "model_runner", None)
             if model_runner is not None:
                 for attr_name in ("gpu_cache", "kv_caches", "kv_cache"):
-                    caches = getattr(model_runner, attr_name, None)
-                    if caches is not None:
-                        if isinstance(caches, list):
-                            flat_caches = []
-                            for item in caches:
-                                if isinstance(item, torch.Tensor):
-                                    flat_caches.append(item)
-                                elif isinstance(item, (list, tuple)):
-                                    for t in item:
-                                        if isinstance(t, torch.Tensor):
-                                            flat_caches.append(t)
-                            if flat_caches:
-                                return flat_caches
-                        elif isinstance(caches, torch.Tensor):
-                            return [caches]
+                    flat = _flatten_cache_tensors(getattr(model_runner, attr_name, None))
+                    if flat:
+                        return flat
 
             # Check cache_engine for gpu_cache
             cache_engine = getattr(self._worker, "cache_engine", None)
             if cache_engine is not None:
-                caches = getattr(cache_engine, "gpu_cache", None)
-                if caches is not None:
-                    if isinstance(caches, list):
-                        flat_caches = []
-                        for item in caches:
-                            if isinstance(item, torch.Tensor):
-                                flat_caches.append(item)
-                            elif isinstance(item, (list, tuple)):
-                                for t in item:
-                                    if isinstance(t, torch.Tensor):
-                                        flat_caches.append(t)
-                        if flat_caches:
-                            return flat_caches
-                    elif isinstance(caches, torch.Tensor):
-                        return [caches]
+                flat = _flatten_cache_tensors(getattr(cache_engine, "gpu_cache", None))
+                if flat:
+                    return flat
 
             return []
 

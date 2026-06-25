@@ -72,13 +72,25 @@ def create_dummy_image(size: int = 448):
     return Image.fromarray(arr)
 
 
-def build_prompts(n: int, image):
-    """Build n multimodal prompt dicts for vLLM offline generation."""
-    prompts = []
-    # Generate a prompt of roughly 2500 words (~2600 tokens), leaving plenty of room 
-    # for the 100 output tokens and the 576 image tokens under the 4096 limit.
+def build_prompts(n: int, image, max_text_tokens: int = 3000):
+    """Build n multimodal prompt dicts for vLLM offline generation.
+
+    Budget calculation (max_model_len=4096):
+      - 576 image tokens (fixed by CLIP ViT-L/14 @ 448×448)
+      - 100 output tokens (requested via SamplingParams)
+      - ~20 tokens for the prompt wrapper (``USER: <image>\\n...\\nASSISTANT:``)
+      - Remaining → text payload tokens
+
+    The default of 3000 text tokens keeps the total well under 4096.
+    Each sentence is ~8 tokens, so we repeat a ~6-token base phrase to hit
+    the target word count.
+    """
+    # Each sentence ≈ 8 tokens; we need roughly max_text_tokens / 8 repetitions
+    # to fill the budget.  Round down with a safety margin.
+    target_repetitions = max_text_tokens // 8
     base_text = "This is a long context test to fill up the KV cache. "
-    long_prompt = base_text * 350
+    long_prompt = base_text * target_repetitions
+    prompts = []
     for i in range(n):
         question = PROMPT_QUESTIONS[i % len(PROMPT_QUESTIONS)]
         prompts.append({
