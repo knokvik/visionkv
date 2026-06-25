@@ -39,7 +39,11 @@ import traceback
 # Constants
 # ---------------------------------------------------------------------------
 
-BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8]
+# Dense small batches to find the exact OOM cliff, then larger steps
+# above it.  Controlled by --max-batch (only sizes <= max_batch run).
+BATCH_SIZES = [
+    1, 2, 4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+]
 
 PROMPT_QUESTIONS = [
     "Describe every detail you can see in this image.",
@@ -191,6 +195,7 @@ def benchmark_mode(mode: str, args) -> dict:
             )
 
             # ---- Optionally install VisionKV ----
+            plugin = None
             if mode == "visionkv":
                 from visionkv.live_integration import VisionKVPlugin
                 from visionkv.policy import VisionKVPolicy
@@ -198,7 +203,7 @@ def benchmark_mode(mode: str, args) -> dict:
                     hot_prefetch_block_count=args.hot_prefetch_block_count,
                     background_prefetch_remainder=True,
                 )
-                VisionKVPlugin(llm, policy=policy).install()
+                plugin = VisionKVPlugin(llm, policy=policy).install()
                 print("  VisionKV plugin installed ✓")
 
             # ---- Build and run batch ----
@@ -226,6 +231,28 @@ def benchmark_mode(mode: str, args) -> dict:
                 "vram_before_mib": round(vram_before, 1),
                 "vram_after_mib": round(vram_after, 1),
             }
+
+            # ---- VisionKV diagnostic: prove the offload actually fired ----
+            if plugin is not None:
+                snap = plugin.snapshot()
+                offload_stats = snap["tensor_offload_stats"]
+                requests = snap["requests"]
+                n_offloaded = sum(
+                    1 for r in requests if r.get("offloaded_block_ids")
+                )
+                offload_mib = offload_stats.get("total_offload_mib", 0.0)
+                result["visionkv_offloaded_requests"] = n_offloaded
+                result["visionkv_total_offload_mib"] = offload_mib
+                result["visionkv_transfer_count"] = offload_stats.get(
+                    "transfer_count", 0
+                )
+                if n_offloaded == 0:
+                    print("  ⚠  VisionKV tagged 0 offloaded requests — "
+                          "eviction never fired!")
+                else:
+                    print(f"  VisionKV: offloaded {n_offloaded}/{len(requests)} "
+                          f"requests, {offload_mib:.1f} MiB moved to CPU")
+
             results.append(result)
 
             print(f"  ✓ SUCCESS  |  {total_out_tokens} tokens in {elapsed:.2f}s")
@@ -404,7 +431,7 @@ def main():
     parser.add_argument("--gpu-mem-util", type=float, default=0.25,
                         dest="gpu_mem_util",
                         help="GPU memory utilization (lower = tighter KV budget)")
-    parser.add_argument("--max-batch", type=int, default=8,
+    parser.add_argument("--max-batch", type=int, default=32,
                         dest="max_batch",
                         help="Largest batch size to attempt")
     parser.add_argument("--hot-prefetch-block-count", type=int, default=2,
