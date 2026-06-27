@@ -130,9 +130,16 @@ def get_vram_mib() -> float:
 
 
 def is_oom_error(exc: Exception) -> bool:
-    """Heuristic check for CUDA OOM or vLLM memory-related failures."""
+    """Heuristic check for CUDA OOM or vLLM memory-related failures.
+
+    Also catches vLLM's generic 'Engine core initialization failed', which is
+    how the EngineCore subprocess surfaces 'No available memory for the cache
+    blocks' (and similar) to the parent process.  Without this we would treat
+    a fatal config error as transient and pointlessly retry every batch size.
+    """
     msg = str(exc).lower()
-    patterns = [
+    # Direct CUDA / allocator messages
+    direct_patterns = [
         "out of memory",
         "oom",
         "cuda error",
@@ -141,7 +148,17 @@ def is_oom_error(exc: Exception) -> bool:
         "no available memory",
         "insufficient",
     ]
-    return any(p in msg for p in patterns)
+    if any(p in msg for p in direct_patterns):
+        return True
+    # vLLM wraps the real cause in a generic RuntimeError during engine init.
+    # These signal a *fatal* memory/config problem, not a transient fault.
+    wrapped_patterns = [
+        "engine core initialization failed",
+        "failed core proc",
+        "no available memory for the cache blocks",
+        "gpu_memory_utilization",
+    ]
+    return any(p in msg for p in wrapped_patterns)
 
 
 def cuda_cleanup():
@@ -428,9 +445,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100,
                         dest="max_tokens",
                         help="Output tokens per request")
-    parser.add_argument("--gpu-mem-util", type=float, default=0.25,
+    parser.add_argument("--gpu-mem-util", type=float, default=0.40,
                         dest="gpu_mem_util",
-                        help="GPU memory utilization (lower = tighter KV budget)")
+                        help="GPU memory utilization (lower = tighter KV budget). "
+                             "Must exceed the model weight footprint (~13 GiB on "
+                             "llava-1.5-7b → ~0.27 on a 48 GB A6000), else the "
+                             "engine cannot allocate ANY KV cache and aborts.")
     parser.add_argument("--max-batch", type=int, default=32,
                         dest="max_batch",
                         help="Largest batch size to attempt")
