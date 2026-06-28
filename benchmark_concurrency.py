@@ -76,31 +76,74 @@ def create_dummy_image(size: int = 448):
     return Image.fromarray(arr)
 
 
-def build_prompts(n: int, image, max_text_tokens: int = 3000):
+def build_prompts(
+    n: int,
+    image,
+    model_name: str,
+    max_total_tokens: int = 4096,
+    output_tokens: int = 100,
+    target_text_tokens: int = 3000,
+):
     """Build n multimodal prompt dicts for vLLM offline generation.
 
-    Budget calculation (max_model_len=4096):
-      - 576 image tokens (fixed by CLIP ViT-L/14 @ 448×448)
-      - 100 output tokens (requested via SamplingParams)
-      - ~20 tokens for the prompt wrapper (``USER: <image>\\n...\\nASSISTANT:``)
-      - Remaining → text payload tokens
+    Budget (max_total_tokens = max_model_len):
+      - 576 image tokens (CLIP ViT-L/14 @ 448x448)
+      - output_tokens reserved for generation
+      - wrapper tokens (USER:/ASSISTANT/...)
+      - Remainder filled with repeated filler text to ~target_text_tokens
 
-    The default of 3000 text tokens keeps the total well under 4096.
-    Each sentence is ~8 tokens, so we repeat a ~6-token base phrase to hit
-    the target word count.
+    Instead of guessing how many tokens a sentence costs, we measure it
+    with the real tokenizer and shrink until the prompt fits.  This avoids
+    the off-by-2x error that previously overflowed 4096 tokens.
     """
-    # Each sentence ≈ 8 tokens; we need roughly max_text_tokens / 8 repetitions
-    # to fill the budget.  Round down with a safety margin.
-    target_repetitions = max_text_tokens // 8
+    from transformers import AutoTokenizer
+
     base_text = "This is a long context test to fill up the KV cache. "
-    long_prompt = base_text * target_repetitions
+
+    # Lazily load the tokenizer once (cached by HF after first call).
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+    def _measure_text(text: str) -> int:
+        return len(tokenizer(text, add_special_tokens=False).input_ids)
+
+    # Fixed cost: wrapper + 576 image tokens + question reserve.
+    wrapper_tokens = _measure_text("USER: <image>\n") + _measure_text("\nASSISTANT:")
+    image_tokens = 576
+    question_reserve = 16  # longest question is ~12 tokens; pad for safety
+    fixed_overhead = wrapper_tokens + image_tokens + question_reserve
+
+    available_for_filler = max_total_tokens - output_tokens - fixed_overhead
+    if available_for_filler <= 0:
+        raise ValueError(
+            "max_total_tokens - output_tokens - fixed overhead leaves no room "
+            f"for text (available={available_for_filler}). Reduce output_tokens "
+            "or increase max_total_tokens."
+        )
+
+    per_sentence_tokens = _measure_text(base_text)
+    if per_sentence_tokens == 0:
+        raise ValueError("Tokenizer returned 0 tokens for base_text — cannot proceed.")
+
+    repeat_count = min(
+        target_text_tokens // per_sentence_tokens,
+        available_for_filler // per_sentence_tokens,
+    )
+    long_prompt = base_text * repeat_count
+
     prompts = []
     for i in range(n):
         question = PROMPT_QUESTIONS[i % len(PROMPT_QUESTIONS)]
+        prompt_str = f"USER: <image>\n{long_prompt}\n{question}\nASSISTANT:"
         prompts.append({
-            "prompt": f"USER: <image>\n{long_prompt}\n{question}\nASSISTANT:",
+            "prompt": prompt_str,
             "multi_modal_data": {"image": image},
         })
+
+    measured_text = _measure_text(prompts[0]["prompt"])
+    total_est = measured_text + image_tokens + output_tokens
+    print(f"  [build_prompts] filler={repeat_count}x  "
+          f"text_tokens={measured_text}  image=576  output={output_tokens}  "
+          f"total≈{total_est}/{max_total_tokens} ✓")
     return prompts
 
 
@@ -157,6 +200,11 @@ def is_oom_error(exc: Exception) -> bool:
         "failed core proc",
         "no available memory for the cache blocks",
         "gpu_memory_utilization",
+        # Context-length overflow is deterministic — the prompt is identical
+        # across all batch sizes, so retrying is pure waste.
+        "maximum context length",
+        "input tokens",
+        "vllmvalidationerror",
     ]
     return any(p in msg for p in wrapped_patterns)
 
@@ -224,7 +272,12 @@ def benchmark_mode(mode: str, args) -> dict:
                 print("  VisionKV plugin installed ✓")
 
             # ---- Build and run batch ----
-            prompts = build_prompts(batch_size, image)
+            prompts = build_prompts(
+                batch_size, image,
+                model_name=args.model,
+                max_total_tokens=args.max_model_len,
+                output_tokens=args.max_tokens,
+            )
             vram_before = get_vram_mib()
 
             t0 = time.perf_counter()
