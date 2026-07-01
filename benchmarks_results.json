@@ -1,0 +1,179 @@
+{
+  "config": {
+    "model": "llava-hf/llava-1.5-7b-hf",
+    "max_model_len": 4096,
+    "max_tokens": 100,
+    "gpu_mem_util": 0.25,
+    "max_batch": 100
+  },
+  "baseline": {
+    "max_batch": 40,
+    "results": [
+      {
+        "batch_size": 5,
+        "status": "OK",
+        "total_output_tokens": 317,
+        "wall_time_s": 4.33,
+        "throughput_tok_s": 73.2,
+        "avg_latency_s": 0.867,
+        "vram_before_mib": 20966.2,
+        "vram_after_mib": 20968.2
+      },
+      {
+        "batch_size": 10,
+        "status": "OK",
+        "total_output_tokens": 634,
+        "wall_time_s": 4.39,
+        "throughput_tok_s": 144.6,
+        "avg_latency_s": 0.439,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 15,
+        "status": "OK",
+        "total_output_tokens": 951,
+        "wall_time_s": 4.4,
+        "throughput_tok_s": 215.9,
+        "avg_latency_s": 0.294,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 20,
+        "status": "OK",
+        "total_output_tokens": 1284,
+        "wall_time_s": 4.52,
+        "throughput_tok_s": 284.0,
+        "avg_latency_s": 0.226,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 25,
+        "status": "OK",
+        "total_output_tokens": 1740,
+        "wall_time_s": 4.52,
+        "throughput_tok_s": 384.9,
+        "avg_latency_s": 0.181,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 30,
+        "status": "OK",
+        "total_output_tokens": 1927,
+        "wall_time_s": 4.41,
+        "throughput_tok_s": 437.1,
+        "avg_latency_s": 0.147,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 35,
+        "status": "OK",
+        "total_output_tokens": 2372,
+        "wall_time_s": 4.46,
+        "throughput_tok_s": 531.2,
+        "avg_latency_s": 0.128,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      },
+      {
+        "batch_size": 40,
+        "status": "OK",
+        "total_output_tokens": 2548,
+        "wall_time_s": 4.41,
+        "throughput_tok_s": 577.7,
+        "avg_latency_s": 0.11,
+        "vram_before_mib": 21389.0,
+        "vram_after_mib": 21391.0
+      }
+    ]
+  },
+  "visionkv": {
+    "max_batch": 40,
+    "results": [
+      {
+        "batch_size": 5,
+        "status": "OK",
+        "total_output_tokens": 317,
+        "wall_time_s": 4.11,
+        "throughput_tok_s": 77.1,
+        "avg_latency_s": 0.822,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 10,
+        "status": "OK",
+        "total_output_tokens": 634,
+        "wall_time_s": 4.42,
+        "throughput_tok_s": 143.3,
+        "avg_latency_s": 0.442,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 15,
+        "status": "OK",
+        "total_output_tokens": 1032,
+        "wall_time_s": 4.62,
+        "throughput_tok_s": 223.2,
+        "avg_latency_s": 0.308,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 20,
+        "status": "OK",
+        "total_output_tokens": 1276,
+        "wall_time_s": 4.68,
+        "throughput_tok_s": 272.6,
+        "avg_latency_s": 0.234,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 25,
+        "status": "OK",
+        "total_output_tokens": 1736,
+        "wall_time_s": 4.59,
+        "throughput_tok_s": 378.0,
+        "avg_latency_s": 0.184,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 30,
+        "status": "OK",
+        "total_output_tokens": 1869,
+        "wall_time_s": 4.54,
+        "throughput_tok_s": 412.1,
+        "avg_latency_s": 0.151,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 35,
+        "status": "OK",
+        "total_output_tokens": 2311,
+        "wall_time_s": 4.55,
+        "throughput_tok_s": 508.1,
+        "avg_latency_s": 0.13,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      },
+      {
+        "batch_size": 40,
+        "status": "OK",
+        "total_output_tokens": 2536,
+        "wall_time_s": 4.51,
+        "throughput_tok_s": 562.2,
+        "avg_latency_s": 0.113,
+        "vram_before_mib": 21409.0,
+        "vram_after_mib": 21411.0
+      }
+    ]
+  }
+}

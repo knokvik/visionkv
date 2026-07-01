@@ -86,6 +86,8 @@ pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 
 The following results were captured on an NVIDIA A6000 (48 GB) running `llava-hf/llava-1.5-7b-hf` with vLLM 0.23.0. The benchmark measures the maximum number of concurrent multimodal requests the engine can serve as a single batch before failure.
 
+![Benchmark Overview](docs/benchmark_overview.png)
+
 ### Configuration
 
 | Parameter | Value |
@@ -102,38 +104,13 @@ The following results were captured on an NVIDIA A6000 (48 GB) running `llava-hf
 
 Aggregate output tokens per second across the full batch.
 
-```
-Throughput (tok/s)
-Baseline vs VisionKV
-
-  504.9 |                                            [V] [B]
-  475.8 |                                       [V]  |
-  466.8 |                                  [V]  |    |
-  435.0 |                             [B]  |    |    |
-  429.0 |                             [V]  |    |    |
-  362.8 |                       [B]   |    |    |    |
-  360.5 |                       [V]   |    |    |    |
-  310.8 |                 [B][V]|     |    |    |    |
-  239.9 |           [B]    |    |     |    |    |    |
-  234.0 |           [V]    |    |     |    |    |    |
-  200.0 |        [B] |     |    |     |    |    |    |
-  203.3 |        [V] |     |    |     |    |    |    |
-  156.3 |     [B]   |     |    |     |    |    |    |
-  159.2 |     [V]   |     |    |     |    |    |    |
-  120.5 |  [B] |    |     |    |     |    |    |    |
-  119.5 |  [V] |    |     |    |     |    |    |    |
-   83.5 |  [B] |    |     |    |     |    |    |    |
-   80.1 |  [V] |    |     |    |     |    |    |    |
-        +--------------------------------------------------
-          1   2   4   8   12  16  20  24  32  40  48  56  64
-                       Concurrent Users
-```
-
-`[B]` = Standard vLLM baseline. `[V]` = VisionKV.
+![Throughput vs Concurrency](docs/benchmark_throughput.png)
 
 ### Latency
 
 Average latency per request at each concurrency level.
+
+![Latency vs Concurrency](docs/benchmark_latency.png)
 
 | Batch | Baseline (s) | VisionKV (s) | Delta |
 |------:|-------------:|-------------:|------:|
@@ -155,14 +132,7 @@ Average latency per request at each concurrency level.
 
 GPU memory consumed at maximum batch size (64 concurrent requests).
 
-```
-Peak VRAM (MiB)
-
-Baseline    | 33,855 MiB |######################
-VisionKV    | 33,873 MiB |######################  (+18 MiB)
-            +--------------------------------------+
-            0     10,000    20,000    30,000    40,000
-```
+![Peak VRAM Utilization](docs/benchmark_vram.png)
 
 ### Interpretation
 
