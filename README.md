@@ -15,54 +15,6 @@ Vision-Language Models (VLMs) such as LLaVA inject hundreds of vision-token KV c
 
 VisionKV tags those vision blocks, offloads them to pinned CPU memory once text generation is underway, and restores them on demand with a budgeted hot-set prefetch strategy.
 
-## How It Works
-
-VisionKV intercepts the vLLM V1 engine at three points to coordinate the offload and prefetch lifecycle:
-
-```mermaid
-flowchart LR
-    A[Multimodal Prompt] --> B[InputProcessor]
-    B -->|Tag vision spans| C[MetadataStore]
-    C --> D[Decode Loop]
-    D -->|After N tokens| E[Evict vision blocks to CPU]
-    E --> F[Free GPU VRAM]
-    F --> G[Serve more concurrent users]
-    D -->|Follow-up image question| H[Hot-set prefetch]
-    H --> I[Background restore]
-    I --> D
-```
-
-1. **Tag** - When a multimodal prompt is preprocessed, VisionKV identifies which KV-cache blocks correspond to vision tokens using the multimodal feature position metadata.
-2. **Evict** - After a configurable number of text-generation tokens (default 50), vision blocks are asynchronously offloaded to pinned CPU memory, freeing GPU VRAM for new requests.
-3. **Prefetch** - If a follow-up question about the image arrives, a hot-set of vision blocks is restored to GPU within a latency budget (default 50 ms). The remainder streams back in the background.
-4. **Repeat** - The cycle continues for multi-turn conversations, keeping VRAM usage low while preserving image understanding.
-
-## Installation
-
-### Prerequisites
-
-- Python 3.10 or later
-- NVIDIA GPU with CUDA 12.x support (tested on NVIDIA A6000, 48 GB)
-- 16 GB system RAM beyond model footprint
-
-### Setup
-
-```bash
-git clone https://github.com/knokvik/visionkv.git
-cd visionkv
-
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-For CUDA 12.8 with the correct PyTorch build:
-
-```bash
-pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-```
-
 ## Benchmark Results
 
 The following results were captured on an NVIDIA A6000 (48 GB) running `llava-hf/llava-1.5-7b-hf` with vLLM 0.23.0. The benchmark measures the maximum number of concurrent multimodal requests the engine can serve as a single batch before failure.
@@ -129,6 +81,55 @@ The VRAM delta of 18 MiB at this batch size reflects the metadata overhead of th
 
 ```bash
 python3 benchmark_concurrency.py --gpu-mem-util 0.40 --enforce-eager --max-batch 64
+```
+
+
+## How It Works
+
+VisionKV intercepts the vLLM V1 engine at three points to coordinate the offload and prefetch lifecycle:
+
+```mermaid
+flowchart LR
+    A[Multimodal Prompt] --> B[InputProcessor]
+    B -->|Tag vision spans| C[MetadataStore]
+    C --> D[Decode Loop]
+    D -->|After N tokens| E[Evict vision blocks to CPU]
+    E --> F[Free GPU VRAM]
+    F --> G[Serve more concurrent users]
+    D -->|Follow-up image question| H[Hot-set prefetch]
+    H --> I[Background restore]
+    I --> D
+```
+
+1. **Tag** - When a multimodal prompt is preprocessed, VisionKV identifies which KV-cache blocks correspond to vision tokens using the multimodal feature position metadata.
+2. **Evict** - After a configurable number of text-generation tokens (default 50), vision blocks are asynchronously offloaded to pinned CPU memory, freeing GPU VRAM for new requests.
+3. **Prefetch** - If a follow-up question about the image arrives, a hot-set of vision blocks is restored to GPU within a latency budget (default 50 ms). The remainder streams back in the background.
+4. **Repeat** - The cycle continues for multi-turn conversations, keeping VRAM usage low while preserving image understanding.
+
+## Installation
+
+### Prerequisites
+
+- Python 3.10 or later
+- NVIDIA GPU with CUDA 12.x support (tested on NVIDIA A6000, 48 GB)
+- 16 GB system RAM beyond model footprint
+
+### Setup
+
+```bash
+git clone https://github.com/knokvik/visionkv.git
+cd visionkv
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+For CUDA 12.8 with the correct PyTorch build:
+
+```bash
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Common flag combinations:
