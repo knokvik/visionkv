@@ -37,25 +37,6 @@ flowchart LR
 3. **Prefetch** - If a follow-up question about the image arrives, a hot-set of vision blocks is restored to GPU within a latency budget (default 50 ms). The remainder streams back in the background.
 4. **Repeat** - The cycle continues for multi-turn conversations, keeping VRAM usage low while preserving image understanding.
 
-### Project Structure
-
-```
-visionkv/
-├── policy.py                # VisionKVPolicy: hot-set size, flashback budget
-├── pytorch_prototype.py     # Standalone tensor transfer timing harness
-├── block_manager.py         # Mock block space manager (GPU/CPU tiering)
-├── controller.py            # Mock eviction/prefetch controller
-├── simulation.py            # Runnable async simulation of the policy
-├── vllm_adapter.py          # vLLM-facing hook surface (adapter layer)
-├── integration_harness.py   # OpenAI-compatible API crash-test harness
-├── benchmark_harness.py     # Baseline-vs-VisionKV comparison helpers
-└── live_integration.py      # Live monkey-patch plugin for pip-installed vLLM
-
-benchmark_concurrency.py     # Concurrency benchmark (primary entry point)
-run_visionkv_vllm.py         # Single-request live integration runner
-tests/                       # Unit tests (29 tests, all passing)
-```
-
 ## Installation
 
 ### Prerequisites
